@@ -174,14 +174,18 @@ def forest_proba_rational(forest: ForestSpec, grams: list[int]) -> Fraction:
     """按整数克数走树，返回森林平均合格概率的精确有理值。"""
     total = Fraction(0)
     for tree in forest.trees:
-        nid = tree.root
-        while True:
-            node = tree.nodes[nid]
-            if isinstance(node, Leaf):
-                total += node.prob1
-                break
-            if grams[node.feature] <= cutoff_left(node.threshold):
-                nid = node.left
-            else:
-                nid = node.right
+        total += tree.nodes[leaf_index(tree, grams)].prob1
     return total / forest.n_trees
+
+
+def leaf_index(tree: TreeSpec, grams: list[int]) -> int:
+    """用与分类器完全相同的整数截断语义走树，返回命中叶子的节点下标。"""
+    nid = tree.root
+    while True:
+        node = tree.nodes[nid]
+        if isinstance(node, Leaf):
+            return nid
+        if grams[node.feature] <= cutoff_left(node.threshold):
+            nid = node.left
+        else:
+            nid = node.right

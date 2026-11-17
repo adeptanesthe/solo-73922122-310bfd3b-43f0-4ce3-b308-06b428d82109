@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .audit import build_audit_sample, leaves_catalog, run_audit
 from .model import (
     FEATURE_NAMES,
     MAX_DEPTH,
@@ -36,6 +37,8 @@ _t0 = time.perf_counter()
 CLF = train_model()
 FOREST = extract_forest(CLF)
 SAMPLES = build_samples(FOREST, CLF)
+AUDIT_SAMPLE = build_audit_sample(CLF)
+LEAVES = leaves_catalog(FOREST)
 TRAIN_SECONDS = time.perf_counter() - _t0
 
 
@@ -98,9 +101,34 @@ def api_samples() -> dict:
     return SAMPLES
 
 
-@app.get("/", include_in_schema=False)
+@app.get("/api/audit/leaves")
+def api_audit_leaves() -> dict:
+    """全部叶节点的静态说明（路径区间、叶内合格概率）。"""
+    return LEAVES
+
+
+@app.get("/api/audit/sample")
+def api_audit_sample() -> dict:
+    """确定性的示例抽检数据（独立种子，标签不来自模型自身判断）。"""
+    return AUDIT_SAMPLE
+
+
+@app.post("/api/audit")
+def api_audit(payload: dict) -> dict:
+    """局部风险核查：抽检记录 + 风险上限 → 逐叶误放行统计与同时置信结论。"""
+    if not isinstance(payload, dict):
+        return {"status": "invalid", "reason": "请求体必须是 JSON 对象", "errors": ["请求体必须是 JSON 对象"]}
+    return run_audit(FOREST, CLF, payload.get("records"), payload.get("risk_limit"))
+
+
+@app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/audit", include_in_schema=False)
+def audit_page():
+    return FileResponse(STATIC_DIR / "audit.html")
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

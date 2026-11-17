@@ -12,7 +12,11 @@
  5. 字典序：改 2 种（量大）与改 3 种（量小）并存时，必须返回改 2 种；
  6. 边界：原配方已合格（0 改动）、全锁定合格/不合格、各类非法输入；
  7. 求解失败路径：异常注入返回 solver_failure 而非无解；
- 8. API：/、/api/meta、/api/samples、/api/solve 各状态分支；页面含迟到结果丢弃逻辑。
+ 8. API：/、/api/meta、/api/samples、/api/solve 各状态分支；页面含迟到结果丢弃逻辑；
+ 9. 局部风险核查：贴入文本解析与逐行校验；放行口径与原分类器 float32 一致；
+    逐叶计数与独立走树一致（多条命中分别计数）；95% 同时置信（Bonferroni +
+    Clopper–Pearson）与“下界严格大于风险上限”判定边界；无放行记录不下结论；
+    /audit 与 /api/audit* 各分支。
 """
 from __future__ import annotations
 
@@ -52,6 +56,217 @@ def check(name, cond, detail=""):
     print(f"[{tag}] {name}" + (f" — {detail}" if detail else ""))
     if not cond:
         failures.append(name)
+
+
+def _stub_forest_one_leaf(prob1):
+    from app.model import ForestSpec, Leaf, TreeSpec
+
+    tree = TreeSpec(nodes=(Leaf(prob1=prob1),))
+    return ForestSpec(trees=(tree,), n_trees=1, max_depth=0, seed=0)
+
+
+class _StubClf:
+    """记录输入 dtype，并按固定概率返回（用于核查口径与单叶计数测试）。"""
+
+    def __init__(self, p=1.0):
+        self.p = p
+        self.dtypes = []
+
+    def predict_proba(self, x):
+        self.dtypes.append(x.dtype)
+        p = np.full(len(x), float(self.p))
+        return np.column_stack([1.0 - p, p])
+
+
+def run_audit_tests(clf, forest, client):
+    from fractions import Fraction
+
+    from app.audit import (
+        DEFAULT_RISK_LIMIT,
+        analyze,
+        build_audit_sample,
+        clopper_pearson_lower,
+        parse_records,
+        parse_risk_limit,
+        run_audit,
+    )
+    from app.model import leaf_index
+
+    # ---- 9.1 解析与校验 ----
+    good_line = "400 300 200 100 合格"
+    ok_text = "\n".join([good_line] * 30)
+    recs, errs = parse_records(ok_text)
+    check("解析 30 行合法记录", not errs and len(recs) == 30 and recs[0].grams == (400, 300, 200, 100))
+    recs, errs = parse_records("\n".join([good_line] * 300))
+    check("解析 300 行合法记录", not errs and len(recs) == 300)
+    _, errs29 = parse_records("\n".join([good_line] * 29))
+    _, errs301 = parse_records("\n".join([good_line] * 301))
+    check("29 行与 301 行均被拒绝", bool(errs29) and bool(errs301))
+
+    recs, errs = parse_records(
+        "400,300,200,100,不合格\n"      # 逗号分隔
+        "400 300 200 100 1\n"          # 数字标签
+        "400 300 200 100 否\n"         # 中文否定标签
+        + "\n".join([good_line] * 27)
+    )
+    check("支持逗号分隔与多种标签写法",
+          not errs and len(recs) == 30 and recs[0].qualified is False
+          and recs[1].qualified is True and recs[2].qualified is False)
+    _, errs = parse_records(good_line + "\n" + "400 300 200 99 合格\n" + "\n".join([good_line] * 28))
+    check("合计不等于 1000 克被拒绝", any("合计" in e for e in errs))
+    _, errs = parse_records(good_line + "\n" + "400 300 200 100 也许\n" + "\n".join([good_line] * 28))
+    check("无法识别的标签被拒绝", any("标签" in e for e in errs))
+    _, errs = parse_records(good_line + "\n" + "400.5 300 200 99.5 合格\n" + "\n".join([good_line] * 28))
+    check("非整数克数被拒绝", any("整数" in e for e in errs))
+    _, errs = parse_records(good_line + "\n" + "-400 700 200 500 合格\n" + "\n".join([good_line] * 28))
+    check("负克数被拒绝", any("为负" in e for e in errs))
+    _, errs = parse_records(good_line + "\n" + "400 300 200 100\n" + "\n".join([good_line] * 28))
+    check("缺少标签的行被拒绝", any("5 项" in e for e in errs))
+
+    check("风险上限：合法值", parse_risk_limit("0.05") == (0.05, None)
+          and parse_risk_limit(0.0) == (0.0, None) and parse_risk_limit(1) == (1.0, None))
+    bad_limits = ["abc", -0.01, 1.01, float("nan"), float("inf"), True, None, []]
+    check("风险上限：非法值均被拒绝", all(parse_risk_limit(v)[0] is None for v in bad_limits))
+
+    # ---- 9.2 放行口径与原分类器一致（float32 输入）----
+    sample = build_audit_sample(clf)
+    sample2 = build_audit_sample(clf)
+    check("示例抽检数据确定性", sample == sample2 and sample["records"] == 120)
+    recs, errs = parse_records(sample["text"])
+    res = run_audit(forest, clf, sample["text"], sample["risk_limit"])
+    check("示例数据核查成功", res["status"] == "ok", str(res)[:200])
+    grams = np.array([r.grams for r in recs], dtype=np.float64)
+    p_expected = clf.predict_proba((grams / TOTAL_GRAMS).astype(np.float32))[:, 1]
+    expect_released = int((p_expected >= 0.7 - 1e-9).sum())
+    check("放行记录数与原分类器逐条一致",
+          res["summary"]["released"] == expect_released == sample["released"],
+          f"{res['summary']['released']} vs {expect_released}")
+    stub = _StubClf()
+    analyze(_stub_forest_one_leaf(Fraction(1, 2)), stub, recs[:30], 0.05)
+    check("核查输入为 float32 比例", stub.dtypes == [np.dtype(np.float32)])
+
+    # ---- 9.3 逐叶计数：每放行记录每树恰命中一叶 ----
+    leaves = res["leaves"]
+    check("全部 40 个叶均被核查", len(leaves) == 40
+          and len({(L["tree"], L["leaf_id"]) for L in leaves}) == 40)
+    expected = {}
+    for r, p in zip(recs, p_expected):
+        if p < 0.7 - 1e-9:
+            continue
+        for ti, tree in enumerate(forest.trees):
+            key = (ti + 1, leaf_index(tree, list(r.grams)))
+            e = expected.setdefault(key, [0, 0])
+            e[0] += 1
+            if not r.qualified:
+                e[1] += 1
+    got = {(L["tree"], L["leaf_id"]): [L["released"], L["released_unqualified"]]
+           for L in leaves if L["released"] > 0}
+    check("逐叶放行数/不合格数与独立走树一致", expected == got,
+          f"{len(expected)} vs {len(got)}")
+    total_hits = sum(v[0] for v in got.values())
+    check("每条放行记录在 5 棵树上各计 1 次（多叶分别计数）",
+          total_hits == res["summary"]["released"] * 5,
+          f"hits={total_hits}, released={res['summary']['released']}")
+    multi = sum(1 for v in got.values() if v[0] > 0)
+    check("存在同一记录命中多个叶的情形", multi > 1 and multi <= 40, f"{multi} 个叶有放行记录")
+
+    # 叶路径区间与记录一致：命中该叶的每条放行记录都必须落在其列出的原料区间内
+    bounds_ok = True
+    leaf_by_key = {(L["tree"], L["leaf_id"]): L for L in leaves}
+    for r, p in zip(recs, p_expected):
+        if p < 0.7 - 1e-9:
+            continue
+        for ti, tree in enumerate(forest.trees):
+            L = leaf_by_key[(ti + 1, leaf_index(tree, list(r.grams)))]
+            for b in L["bounds"]:
+                if not (b["min"] <= r.grams[b["feature"]] <= b["max"]):
+                    bounds_ok = False
+    check("叶路径原料限制覆盖其全部命中记录", bounds_ok)
+
+    # ---- 9.4 同时置信与判定门槛 ----
+    n, m = 40, 40
+    alpha_corr = 0.05 / m
+    manual = float(__import__("scipy.stats", fromlist=["beta"]).beta.ppf(alpha_corr, 7, n - 7 + 1))
+    lv = {L["tree"]: L for L in leaves}
+    check("校正显著性水平 = 0.05 / 叶数",
+          abs(res["summary"]["alpha_corrected"] - alpha_corr) < 1e-12)
+    check("Clopper–Pearson 下界与 scipy 一致",
+          abs(clopper_pearson_lower(7, n, alpha_corr) - manual) < 1e-12)
+
+    # 构造全部放行记录均不合格的抽检数据 → 误放行率应为 1，应触发暂停
+    lines = []
+    for r in recs:
+        p = float(clf.predict_proba((np.array([r.grams], dtype=np.float32) / TOTAL_GRAMS))[0, 1])
+        label = "不合格" if p >= 0.7 - 1e-9 else "合格"
+        lines.append(f"{r.grams[0]} {r.grams[1]} {r.grams[2]} {r.grams[3]} {label}")
+    bad_text = "\n".join(lines)
+    res_bad = run_audit(forest, clf, bad_text, 0.05)
+    paused = [L for L in res_bad["leaves"] if L["decision"] == "pause"]
+    check("放行记录全不合格且样本充足 → 触发暂停", res_bad["status"] == "ok" and len(paused) > 0,
+          f"{len(paused)} 个叶")
+    check("暂停叶的校正下界严格大于风险上限",
+          all(L["lower_bound"] > 0.05 and L["released"] > 0 for L in paused))
+    check("未触发叶均为证据不足（无其他结论）",
+          all(L["decision"] in ("pause", "insufficient") for L in res_bad["leaves"]))
+
+    # 同一批数据、把风险上限提到 1 → 没有任何叶可判暂停
+    res_hi = run_audit(forest, clf, bad_text, 1.0)
+    check("风险上限为 1 时不判暂停", res_hi["summary"]["leaves_flagged"] == 0)
+
+    # 精确边界：下界 == 上限 → 证据不足；上限略低于下界 → 暂停
+    stub = _StubClf(1.0)   # 桩分类器把每条记录都判为放行
+    r30 = [type(recs[0])(r.grams, False, r.line_no) for r in recs[:30]]  # 标签全为不合格
+    res_stub = analyze(_stub_forest_one_leaf(Fraction(1, 2)), stub, r30, 0.05)
+    L = res_stub["leaves"][0]
+    n_rel, k_rel = L["released"], L["released_unqualified"]
+    check("单叶桩：放行/不合格计数正确", n_rel == 30 and k_rel == 30)
+    exact = L["lower_bound"]
+    check("单叶下界与 Clopper–Pearson(30,30,0.05) 一致",
+          abs(exact - clopper_pearson_lower(30, 30, 0.05)) < 1e-12)
+    at = analyze(_stub_forest_one_leaf(Fraction(1, 2)), stub, r30, exact)["leaves"][0]
+    below = analyze(_stub_forest_one_leaf(Fraction(1, 2)), stub, r30, exact - 1e-9)["leaves"][0]
+    check("下界等于上限 → 证据不足（须严格大于）", at["decision"] == "insufficient")
+    check("上限略低于下界 → 建议暂停", below["decision"] == "pause")
+
+    # 没有放行记录 → 全部证据不足（即使风险上限为 0）
+    no_release = "\n".join(
+        [f"{r.grams[0]} {r.grams[1]} {r.grams[2]} {r.grams[3]} 合格"
+         for r in recs if clf.predict_proba((np.array([r.grams], dtype=np.float32) / TOTAL_GRAMS))[0, 1] < 0.7]
+    )
+    n_nr = len(no_release.splitlines())
+    res_nr = run_audit(forest, clf, no_release, 0.0) if n_nr >= 30 else None
+    check("无放行记录时不下结论", res_nr is not None and res_nr["summary"]["released"] == 0
+          and all(L["decision"] == "insufficient" and L["lower_bound"] == 0.0
+                  for L in res_nr["leaves"]),
+          f"n={n_nr}")
+
+    # ---- 9.5 API ----
+    r = client.get("/audit")
+    check("GET /audit 返回核查网页", r.status_code == 200 and "局部风险核查" in r.text
+          and "审核" not in r.text)
+    r = client.get("/api/audit/leaves")
+    jl = r.json()
+    check("GET /api/audit/leaves 列出 40 个叶", r.status_code == 200 and jl["leaves_total"] == 40
+          and len(jl["leaves"]) == 40)
+    r = client.get("/api/audit/sample")
+    check("GET /api/audit/sample 返回示例", r.status_code == 200
+          and r.json()["records"] == 120)
+    r = client.post("/api/audit", json={"records": sample["text"], "risk_limit": "0.03"})
+    j = r.json()
+    check("POST /api/audit 正常分支", r.status_code == 200 and j["status"] == "ok"
+          and j["summary"]["records"] == 120 and j["summary"]["risk_limit"] == 0.03)
+    r = client.post("/api/audit", json={"records": sample["text"], "risk_limit": "abc"})
+    check("POST /api/audit 非法风险上限", r.json()["status"] == "invalid")
+    r = client.post("/api/audit", json={"records": "1 2 3 4 合格", "risk_limit": 0.05})
+    check("POST /api/audit 非法记录", r.json()["status"] == "invalid"
+          and any("30" in e for e in r.json()["errors"]))
+    r = client.post("/api/audit", json={"records": 42, "risk_limit": 0.05})
+    check("POST /api/audit 非文本记录", r.json()["status"] == "invalid")
+    html = client.get("/audit").text
+    check("核查页含迟到结果丢弃与即时撤回逻辑",
+          "my !== epoch" in html and "invalidate(" in html and "abort" in html)
+    check("试配页保留", client.get("/").status_code == 200
+          and "开始求解" in client.get("/").text)
 
 
 def main():
@@ -248,6 +463,9 @@ def main():
     check("POST /api/solve 非法输入分支", r.json()["status"] == "invalid")
     html = client.get("/").text
     check("页面含迟到结果丢弃逻辑", "my !== epoch" in html and "abort" in html)
+
+    print("== 9. 局部风险核查 ==")
+    run_audit_tests(clf, forest, client)
 
     print()
     if failures:
